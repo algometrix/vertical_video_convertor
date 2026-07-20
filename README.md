@@ -2,7 +2,7 @@
 
 # 🎬 Vertical Video Converter
 
-**Turn horizontal podcasts, interviews, and talks into vertical clips with automatic face tracking.**
+**Turn horizontal podcasts, interviews, and talks into short-form vertical videos for TikTok, Instagram Reels, and YouTube Shorts, with automatic face tracking.**
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -10,6 +10,8 @@
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/algometrix/vertical_video_convertor/pulls)
 
 `16:9 in` ➜ `9:16 out`, with the speaker kept in frame the whole time.
+
+No manual keyframing, no reframing by hand: point it at a recording and get a social-ready vertical cut.
 
 </div>
 
@@ -29,6 +31,17 @@
 - ⚡ **GPU (CUDA) or CPU** inference, your choice at install time
 
 Built for talking-head content: podcasts, interviews, panels, stage talks. One primary subject per shot, sitting or standing. It is intentionally simple, with no pose estimation or multi-person choreography.
+
+## 💡 Use Cases
+
+Turning long-form horizontal recordings into short-form vertical clips for social platforms:
+
+- **Podcast and interview clips** for TikTok, Instagram Reels, and YouTube Shorts
+- **Conference and stage talks** cut down to quotable moments
+- **Webinars, lectures, and course recordings** repurposed as teasers
+- **Batch repurposing**: point it at an existing back catalogue instead of reframing each clip by hand in an editor
+
+Pick the platform aspect ratio with `-r`: `9/16` (default, Reels/Shorts/TikTok), `4/5` (Instagram feed), or `1/1` (square).
 
 ## 🎥 Demo
 
