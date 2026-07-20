@@ -13,6 +13,8 @@
 
 No manual keyframing, no reframing by hand: point it at a recording and get a social-ready vertical cut.
 
+*Also known as: smart crop, auto-crop, auto-reframe, horizontal-to-vertical video conversion, 16:9 to 9:16 converter.*
+
 </div>
 
 ---
@@ -278,6 +280,26 @@ uv run ruff format .               # format
 │   └── cli.py             # `vvc` entry point
 └── tests/                 # unit tests for the tracking pieces
 ```
+
+## ❓ FAQ
+
+**How do I convert a 16:9 video to 9:16 automatically?**
+Run `vvc input.mp4`. The face is detected per frame and the crop follows the speaker, so no manual keyframing is needed.
+
+**Does it work without a GPU?**
+Yes. Install the `[cpu]` extra and pass `--cpu`. Expect roughly 20-25 fps on a typical laptop CPU versus 70+ fps on a CUDA GPU.
+
+**Can it output Instagram feed (4:5) or square (1:1) instead of 9:16?**
+Yes: `vvc input.mp4 -r 4/5` or `-r 1/1`. Any `W/H` ratio that fits inside the source width works.
+
+**Does it keep the audio?**
+Yes. The processed video is muxed with the original audio track (video copied losslessly, audio encoded to AAC).
+
+**What if there are two people in the frame?**
+It locks onto one primary face and stays there; it will not flip back and forth between similar faces. There is no split-screen or multi-subject mode.
+
+**Can it track a person when their face is not visible?**
+Only briefly. The camera holds its position for a couple of seconds during dropouts, then recenters. There is no body/pose tracking, which keeps the install small and the behavior predictable for talking-head footage.
 
 ## 🤝 Contributing
 

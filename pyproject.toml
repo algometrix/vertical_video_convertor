@@ -5,14 +5,34 @@ build-backend = "hatchling.build"
 [project]
 name = "vertical-video-converter"
 version = "1.0.0"
-description = "Convert horizontal videos (podcasts, interviews, talks) to vertical with automatic face tracking"
+description = "Automatically convert horizontal videos into vertical short-form clips (TikTok, Reels, Shorts) with face-tracking smart crop"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 authors = [
     { name = "Ashish Nagar", email = "ashishnagar31@gmail.com" },
 ]
-keywords = ["video", "vertical", "shorts", "reels", "face-detection", "face-tracking", "ffmpeg"]
+keywords = [
+    "video",
+    "video-processing",
+    "video-editing",
+    "vertical-video",
+    "short-form-video",
+    "shorts",
+    "reels",
+    "tiktok",
+    "youtube-shorts",
+    "social-media",
+    "face-detection",
+    "face-tracking",
+    "smart-crop",
+    "auto-crop",
+    "computer-vision",
+    "insightface",
+    "opencv",
+    "ffmpeg",
+    "podcast",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
