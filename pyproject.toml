@@ -3,51 +3,94 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "vertical_video_converter"
-version = "0.1.0"
-description = "Video conversion to vertical format using face detection"
+name = "vertical-video-converter"
+version = "1.0.0"
+description = "Automatically convert horizontal videos into vertical short-form clips (TikTok, Reels, Shorts) with face-tracking smart crop"
 readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.10"
 authors = [
     { name = "Ashish Nagar", email = "ashishnagar31@gmail.com" },
 ]
+keywords = [
+    "video",
+    "video-processing",
+    "video-editing",
+    "vertical-video",
+    "short-form-video",
+    "shorts",
+    "reels",
+    "tiktok",
+    "youtube-shorts",
+    "social-media",
+    "face-detection",
+    "face-tracking",
+    "smart-crop",
+    "auto-crop",
+    "computer-vision",
+    "insightface",
+    "opencv",
+    "ffmpeg",
+    "podcast",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Video :: Conversion",
+]
 dependencies = [
-    "insightface==0.7.3",
-    "opencv-python==4.8.0.74",
-    "numpy==1.26.4",
+    "insightface>=0.7.3",
+    "opencv-python>=4.10",
+    "numpy>=1.26,<3",
 ]
 
 [project.optional-dependencies]
-dev = [
-    "black>=23.0.0",
-    "isort>=5.12.0",
-    "flake8>=6.0.0",
-    "pytest>=7.4.0",
-    "pip-tools>=7.3.0",
+cpu = [
+    "onnxruntime>=1.20",
 ]
 gpu = [
-    "onnxruntime-gpu==1.14.1",
+    "onnxruntime-gpu>=1.20",
 ]
-cpu = [
-    "onnx==1.14.0",
-    "onnxruntime==1.14.0",
+
+[project.scripts]
+vvc = "vertical_video_converter.cli:main"
+
+[project.urls]
+Repository = "https://github.com/algometrix/vertical_video_convertor"
+Issues = "https://github.com/algometrix/vertical_video_convertor/issues"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.8",
 ]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/vertical_video_converter"]
 
-[tool.black]
-line-length = 88
-target-version = ['py310']
-include = '\.pyi?$'
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+src = ["src", "tests"]
 
-[tool.isort]
-profile = "black"
-multi_line_output = 3
-py_version = 310
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "SIM", # flake8-simplify
+    "C4",  # flake8-comprehensions
+]
 
 [tool.pytest.ini_options]
-minversion = "7.0"
+minversion = "8.0"
 addopts = "-ra -q"
-python_files = ["test_*.py"]
-python_version = "3.10"
+testpaths = ["tests"]
