@@ -24,7 +24,7 @@ No manual keyframing, no reframing by hand: point it at a recording and get a so
 - 🎥 **Cinematic camera motion**: distance-scaled easing with a hard speed cap (one crop-width per second), so the crop never whip-pans
 - ✂️ **Scene-cut aware**: hard cuts between camera angles snap instantly instead of smearing across the cut
 - 🛡️ **Dropout tolerant**: brief detection losses (turned head, hand in front of the face) hold the camera instead of jerking it away
-- 🧘 **No excessive tracking**: the camera does not re-aim while the face stays within a refocus band around the current aim, so a speaker swaying in their chair never drags the crop around (measured: frames with camera movement drop from 53% to 29% on real footage)
+- 🧘 **No excessive tracking**: the camera does not re-aim while the face stays within a refocus band around the current aim, so a speaker swaying in their chair never drags the crop around
 - 🔇 **Anti-jitter throughout**: detector wobble is filtered at every stage, from the raw detections down to the rendered crop
 - 🎞️ **Sub-pixel panning**: the crop is sampled at the exact float camera position (bilinear), so pans glide smoothly even on low-resolution sources where 1px steps would look choppy
 - 🔊 **Audio preserved** via a lossless-video ffmpeg mux
@@ -244,7 +244,7 @@ VideoReader (thread) ──► InsightFace detection (GPU/CPU)
                                         ffmpeg audio mux ──► output.mp4
 ```
 
-The tracking rules are distilled from a much larger production tracker and are documented in the module docstrings. The load-bearing ones:
+The tracking rules are documented in the module docstrings. The main ones:
 
 1. **Sticky selection** (`face_tracker.py`): the current face keeps the camera unless a challenger scores 50% higher. Re-picking "the best face" fresh every frame flips between similar faces.
 2. **Refocus band** (`smoothing.py`): the camera aim only changes when the face escapes a band around it (default 3% of frame width). Wobble and sway inside the band leave the crop perfectly still; a real move is followed with one band radius of lag. Tune with `--refocus-band`: larger = calmer, `0` disables.
