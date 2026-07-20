@@ -1,406 +1,339 @@
-# Same content as previous analyzer.py, just renamed the file """Main module for video conversion functionality."""
+"""Horizontal-to-vertical video conversion driven by face tracking.
 
+Pipeline:
+
+    VideoReader (thread) -> face detection (InsightFace) -> FaceTracker
+        -> TargetSmoother -> crop -> CropSmoother -> VideoWriter (thread)
+        -> ffmpeg audio mux
+
+Built for talking-head content (podcasts, interviews, stage talks): one
+primary subject per shot, mostly sitting or standing, hard cuts between
+camera angles.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Tuple, Optional, List
-import cv2
-import numpy as np
-import subprocess
-import shutil
-import os
-from insightface.app import FaceAnalysis
+from queue import Empty, Full, Queue
 from threading import Event
-from collections import deque
-import re
 
-from queue import Queue
-from .video_writer import VideoWriter
-from .video_reader import VideoReader
-from .video_reader import VideoFrame
-from .video_writer import DisplayFrame
+from insightface.app import FaceAnalysis
+
+from .cropping import SubpixelCropper
+from .face_tracker import FaceTracker
+from .scene_detector import SceneCutDetector
+from .smoothing import TargetSmoother
+from .video_reader import VideoFrame, VideoReader
+from .video_writer import OutputItem, VideoWriter, compose_side_by_side
+
+QUEUE_SIZE = 50
+PROGRESS_EVERY_FRAMES = 30
+
 
 @dataclass
 class VideoInfo:
-    """Video information container."""
     width: int
     height: int
     fps: float
+    frame_count: int
+    has_audio: bool
 
 
-class WeighedAverage:
-    # Calculate the weighted average of the given values using np.average
-    def __init__(self, alpha: float) -> None:
-        self.alpha = alpha
-        self.values = deque(maxlen=5)
+def _require_ffmpeg() -> None:
+    for tool in ("ffmpeg", "ffprobe"):
+        if not shutil.which(tool):
+            raise RuntimeError(
+                f"{tool} not found on PATH. Install ffmpeg:\n"
+                "- Ubuntu/Debian: sudo apt install ffmpeg\n"
+                "- macOS:         brew install ffmpeg\n"
+                "- Windows:       winget install Gyan.FFmpeg"
+            )
 
-    def add(self, value: tuple) -> None:
-        self.values.append(value)
 
-    def average(self) -> tuple:
-        if len(self.values) == 0:
-            return (0, 0)
-        x, y = zip(*self.values)
-        return (
-            int(np.average(x, weights=np.linspace(1, self.alpha, len(x)))),
-            int(np.average(y, weights=np.linspace(1, self.alpha, len(y)))),
-        )
-    
+def _probe_video(input_path: Path) -> VideoInfo:
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "stream=codec_type,width,height,avg_frame_rate,nb_frames",
+        "-of",
+        "json",
+        str(input_path),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffprobe failed for {input_path}: {result.stderr.strip()}")
 
-class VerticalVideo:
-    def __init__(
-        self,
-        video_path: Path,
-        app: FaceAnalysis,
-        output_path: Path,
-        face_threshold=70,
-        show_video=True,
-    ) -> None:
-        self.video_path: Path = video_path
-        self.queue = None
-        self.video_reader_thread = None
-        self.video_writer_thread = None
-        self.fa = app
-        self.face_threshold = face_threshold
-        self.output_queue = None
-        self.stop_event = Event()
-        self.output_path = output_path
-        self.show_video = show_video
+    streams = json.loads(result.stdout).get("streams", [])
+    video = next((s for s in streams if s.get("codec_type") == "video"), None)
+    if video is None:
+        raise ValueError(f"No video stream found in {input_path}")
 
-    def __del__(self) -> None:
-        self.stop_event.set()
-        if self.video_reader_thread:
-            self.video_reader_thread.join()
-        if self.video_writer_thread:
-            self.video_writer_thread.join()
+    numerator, _, denominator = video.get("avg_frame_rate", "0/1").partition("/")
+    fps = float(numerator) / float(denominator or 1) if float(denominator or 1) else 0.0
+    if fps <= 0:
+        raise ValueError(f"Could not determine fps for {input_path}")
 
-    def start(self) -> None:
-        pass
+    try:
+        frame_count = int(video.get("nb_frames", 0))
+    except (TypeError, ValueError):
+        frame_count = 0
 
-    def stop(self) -> None:
-        pass
+    return VideoInfo(
+        width=int(video["width"]),
+        height=int(video["height"]),
+        fps=fps,
+        frame_count=frame_count,
+        has_audio=any(s.get("codec_type") == "audio" for s in streams),
+    )
 
+
+def _even(value: float) -> int:
+    return max(2, round(value / 2) * 2)
 
 
 class VerticalVideoConverter:
-    """Class to handle video conversion to vertical format."""
+    """Converts horizontal video to a face-tracked vertical crop."""
 
-    def __init__(self, model_name: str = "buffalo_l") -> None:
-        """Initialize the video converter.
-
-        Args:
-            model_name: Name of the face detection model. Defaults to "buffalo_l".
-        """
-        self._check_ffmpeg()
-        self.app = FaceAnalysis(name=model_name, allowed_modules=["detection"], providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
-        self.app.prepare(ctx_id=0, det_size=(256, 256))
-        self.temp_dir = None
-
-    def _check_ffmpeg(self) -> None:
-        """Check if ffmpeg is installed and accessible."""
-        if not shutil.which('ffmpeg'):
-            raise RuntimeError(
-                "ffmpeg not found. Please install ffmpeg:\n"
-                "- Ubuntu/Debian: sudo apt-get install ffmpeg\n"
-                "- MacOS: brew install ffmpeg\n"
-                "- Windows: download from https://ffmpeg.org/download.html"
-            )
-
-    def _get_video_info(self, input_path: Path) -> VideoInfo:
-        """Get video information using ffmpeg.
-        
-        Args:
-            input_path: Path to input video
-            
-        Returns:
-            VideoInfo containing width, height, and fps
-        """
-        cmd = [
-            'ffmpeg', '-i', str(input_path),
-            '-hide_banner'
-        ]
-        
-        try:
-            output = subprocess.check_output(
-                cmd, 
-                stderr=subprocess.STDOUT,
-                text=True
-            )
-        except subprocess.CalledProcessError as e:
-            output = e.output
-
-        width = height = fps = None
-
-        # Parse video information
-        for line in output.split('\n'):
-            if 'Stream' in line and 'Video' in line:
-                video_data = line[line.find('Video:'):]
-                # Video: h264 (Main) (avc1 / 0x31637661), yuv420p(tv, bt709, progressive), 1280x720 [SAR 1:1 DAR 16:9], 247 kb/s, 25 fps, 25 tbr, 12800 tbn (default)
-                resolution_match = re.search(r'(\d{2,})x(\d{2,})(?!\[0x[0-9a-fA-F]+\])', video_data)
-                if resolution_match:
-                    width = int(resolution_match.group(1))
-                    height = int(resolution_match.group(2))
-
-                # Extract fps from various formats
-                fps_match = re.search(r'(\d+(?:\.\d+)?)\s*(?:fps|tbr)', video_data) 
-                if fps_match:
-                    fps = float(fps_match.group(1))
-
-        if not all([width, height, fps]):
-            raise ValueError("Could not extract video information")
-                        
-        return VideoInfo(width=width, height=height, fps=fps)
-
-    def stop(self) -> None:
-        self.stop_event.set()
-        if self.video_reader_thread:
-            self.video_reader_thread.stop()
-            self.video_reader_thread.join()
-        if self.video_writer_thread:
-            self.video_writer_thread.stop()
-            self.video_writer_thread.join()
-    
-    def create_vertical_video(
-        self, 
-        input_path: str | Path, 
-        output_path: str | Path = None, 
-        vertical_video_ratio: str = "9/16",
-        height_ratio: float = 1.0,         
+    def __init__(
+        self,
+        model_name: str = "buffalo_l",
+        det_size: int = 640,
+        use_gpu: bool = True,
     ) -> None:
-        """Convert horizontal video to vertical format focusing on faces.
+        _require_ffmpeg()
+        providers = ["CPUExecutionProvider"]
+        if use_gpu:
+            providers.insert(0, "CUDAExecutionProvider")
+        self.app = FaceAnalysis(
+            name=model_name,
+            allowed_modules=["detection"],
+            providers=providers,
+        )
+        self.app.prepare(ctx_id=0 if use_gpu else -1, det_size=(det_size, det_size))
+
+    def create_vertical_video(
+        self,
+        input_path: str | Path,
+        output_dir: str | Path | None = None,
+        aspect_ratio: str = "9/16",
+        height_ratio: float = 1.0,
+        headroom: float = 0.42,
+        hold_seconds: float = 2.0,
+        scene_cut_threshold: float = 28.0,
+        refocus_band: float | None = None,
+        show_preview: bool = False,
+        compare_preview: bool = False,
+    ) -> Path:
+        """Convert one video; returns the output file path.
 
         Args:
-            input_path: Path to input video file
-            output_path: Path to save output video
-            target_width: Width of the output vertical video
+            input_path: Source video.
+            output_dir: Output directory (defaults to the source's directory).
+            aspect_ratio: Output aspect as "W/H", e.g. "9/16".
+            height_ratio: Crop height as a fraction of source height.
+            headroom: Vertical position of the face in the crop
+                (0.5 = centered, smaller = closer to the top).
+            hold_seconds: How long to hold the last face position when
+                detection drops out before recentering.
+            scene_cut_threshold: Sensitivity of hard-cut detection
+                (lower = more sensitive).
+            refocus_band: The camera does not re-aim while the face center
+                stays within this fraction of frame width of the current
+                aim (default 0.03). Larger = calmer camera; 0 disables.
+            show_preview: Show a live preview window (press q to stop).
+            compare_preview: Preview the original and the converted frame
+                side by side (implies show_preview).
         """
-
         input_path = Path(input_path)
-        self.input_path = input_path
-        video_suffix = input_path.suffix
-        sanitized_file_name = input_path.stem.replace("'", "")
-        aspect_ratio = vertical_video_ratio.split("/")
-        aspect_ratio_width = int(aspect_ratio[0])
-        aspect_ratio_height = int(aspect_ratio[1])
-
-        if output_path is None:
-            output_path = input_path.parent
-
-        if isinstance(output_path, str):
-            output_path = Path(output_path)
-
-        if not output_path.is_dir():
-            raise ValueError(f"Output path is not a directory: {output_path}")
-
-        video_output_path = Path(output_path) / f"{sanitized_file_name}_vertical_{aspect_ratio_width}x{aspect_ratio_height}{video_suffix}"
-        
         if not input_path.exists():
-            raise ValueError(f"Input video not found: {input_path}")
-        if not output_path.exists():
-            raise ValueError(f"Output directory not found: {output_path.parent}")
-        if video_output_path.exists():
-            raise ValueError(f"Output file already exists: {output_path}")
+            raise FileNotFoundError(f"Input video not found: {input_path}")
+        if not 0.0 < headroom <= 1.0:
+            raise ValueError("headroom must be in (0, 1]")
+        if not 0.0 < height_ratio <= 1.0:
+            raise ValueError("height_ratio must be in (0, 1]")
 
-        
+        output_dir = Path(output_dir) if output_dir is not None else input_path.parent
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-        video_info = self._get_video_info(input_path)
-        target_height = int(video_info.height * height_ratio)
-        target_width = int(target_height * aspect_ratio_width / aspect_ratio_height)
-
-        
-        if not input_path.exists():
-            raise ValueError(f"Input video not found: {input_path}")
-
-        # Create temporary directory for intermediate files
-        temp_dir = output_path / "temp_conversion"
-        temp_dir.mkdir(exist_ok=True)
-        temp_video = temp_dir / f"temp_video{video_suffix}"
-        self.temp_dir = temp_dir
+        ratio_w, _, ratio_h = aspect_ratio.partition("/")
         try:
-            # Get video properties
-            try:
-                video_info = self._get_video_info(input_path)
-                
-                input_queue = Queue(maxsize=50)
-                output_queue = Queue(maxsize=50)
-                self.stop_event = Event()    
-                self.video_reader_thread = VideoReader(input_path, input_queue)
-                self.video_writer_thread = VideoWriter(temp_video, output_queue, (target_width, target_height), video_info.fps, self.stop_event, show_video=True)
+            ratio = int(ratio_w) / int(ratio_h)
+        except (ValueError, ZeroDivisionError) as error:
+            raise ValueError(f'aspect_ratio must look like "9/16", got "{aspect_ratio}"') from error
 
-                self.video_reader_thread.start()
-                self.video_writer_thread.start()
+        info = _probe_video(input_path)
+        crop_h = _even(min(info.height, info.height * height_ratio))
+        crop_w = _even(crop_h * ratio)
+        if crop_w > info.width:
+            raise ValueError(
+                f"Crop {crop_w}x{crop_h} is wider than the source ({info.width}px); "
+                "lower height_ratio or pick a narrower aspect_ratio"
+            )
 
-                # For smooth tracking
-                smooth_x = video_info.width // 2
-                smooth_y = video_info.height // 2
-                smooth_factor = 0.2
-                # Track when we last saw a face
-                last_face_time = 0
-                face_timeout = 10  # seconds
-                
-                while True:
-                    read:VideoFrame = input_queue.get()
-                    if not read:
-                        break
+        output_path = output_dir / f"{input_path.stem}_vertical_{ratio_w}x{ratio_h}.mp4"
+        if output_path.exists():
+            raise FileExistsError(f"Output already exists: {output_path}")
 
-                    current_time = read.frame_number / video_info.fps
-                    # Detect faces
-                    faces = self.app.get(read.frame)
-                    
-                    # Get main face center
-                    if not faces:
-                        has_face = False
-                    else:
-                        main_face = max(faces, key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]))
-                        center_x = int((main_face.bbox[0] + main_face.bbox[2]) // 2)
-                        center_y = int((main_face.bbox[1] + main_face.bbox[3]) // 2)
-                        has_face = True
-                        last_face_time = current_time
+        with tempfile.TemporaryDirectory(prefix="vvc_", dir=output_dir) as temp_dir:
+            temp_video = Path(temp_dir) / f"video_only{output_path.suffix}"
+            self._process_frames(
+                input_path,
+                temp_video,
+                info,
+                crop_w,
+                crop_h,
+                headroom,
+                hold_seconds,
+                scene_cut_threshold,
+                refocus_band,
+                show_preview or compare_preview,
+                compare_preview,
+            )
+            self._mux_audio(temp_video, input_path, output_path, info.has_audio)
 
-                    # Process frame if we have a face or saw one recently
-                    if has_face or (current_time - last_face_time) <= face_timeout:
-                        if has_face:
-                            smooth_x = int(smooth_x * (1 - smooth_factor) + center_x * smooth_factor)
-                            smooth_y = int(smooth_y * (1 - smooth_factor) + center_y * smooth_factor)
-                        
-                        # Calculate crop region
-                        crop_width = target_width
-                        crop_height = target_height
-
-                        left = max(0, min(video_info.width - crop_width, smooth_x - crop_width // 2))
-                        top = max(0, min(video_info.height - crop_height, smooth_y - crop_height // 2))
-
-                        # Crop and resize
-                        vertical = read.frame[top:top + crop_height, left:left + crop_width, :]
-                        # vertical = cv2.resize(cropped, (target_width, target_height))
-                        output_queue.put(DisplayFrame(vertical, read.frame_number, read.frame_number * 1000 / video_info.fps))
-
-                
-                self.stop()
-            except KeyboardInterrupt:
-                print("\nStopping video processing...")
-                self.stop()
-            except Exception as e:
-                print(f"Error in video conversion: {e}")
-            
-            audio_parts = self._extract_audio()
-            self._combine_audio_parts(audio_parts)
-            vertical_video_output_path = output_path / f"{self.input_path.stem}_vertical_{vertical_video_ratio.replace('/', '_')}{video_suffix}"
-            self._add_audio_to_video(vertical_video_output_path)
-
-            
-
-        finally:
-            # Clean up temporary files and directory
-            for file in self.temp_dir.glob('*'):
-                try:
-                    file.unlink()
-                except Exception as e:
-                    print(f"Warning: Could not delete temporary file {file}: {e}")
-            
-            try:
-                self.temp_dir.rmdir()
-            except Exception as e:
-                print(f"Warning: Could not remove temporary directory {self.temp_dir}: {e}")
-            
-
-    def _extract_audio(self) -> List[Path]:
-        audio_data_txt = self.temp_dir / "temp_video.txt"
-        with open(str(audio_data_txt), "r") as f:
-            time_ranges = f.readlines()
-        # Convert the time ranges to list of tuples
-        time_ranges = [
-            tuple(map(lambda x: x.strip(), time.split("-"))) for time in time_ranges
-        ]
-        print(f"[*] Extracting audio fragments. Total Fragments : {len(time_ranges)}")
-        extracted_audio: List[Path] = []
-        # Create the command to extract the audio for the time ranges
-        for index, time_range in enumerate(time_ranges):
-            start, end = time_range
-            sanitized_filename = self.input_path.stem.replace("'", "")
-            audio_output = self.temp_dir / f"{sanitized_filename}_{index}.mp3"
-            command = [
-                "ffmpeg",
-                "-i",
-                str(self.input_path),
-                "-ss",
-                start,
-                "-to",
-                end,
-                "-avoid_negative_ts",
-                "1",
-                str(audio_output),
-            ]
-            extracted_audio.append(audio_output)
-            # print(" ".join(command))
-            ret = subprocess.run(command, capture_output=True, text=True)
-            if ret.returncode != 0:
-                print(f"[-] Error extracting audio fragment {index}")
-                print(ret.stderr)
-            else:
-                print(
-                    f"[*] Extracted audio for fragment : {index+1}/{len(time_ranges)}",
-                    end="\r",
-                )
-
-        print("[*] Extracted audio fragments.")
-        return extracted_audio
-    
-    def _combine_audio_parts(self, audio_parts: List[Path]) -> Path:
-        output_path = self.temp_dir / "temp_audio.mp3"
-        temp_audio_merge_list = self.temp_dir / "temp_audio_merge_list.txt"
-        with open(str(temp_audio_merge_list), "w") as f:
-            f.write("\n".join([f"file '{audio_path}'" for audio_path in audio_parts]))
-        # Join the audio files using ffmpeg
-        # ffmpeg -f concat -safe 0 -i filelist.txt -c copy output_audio.mp3
-        command = [
-            "ffmpeg",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(temp_audio_merge_list),
-            "-c",
-            "copy",
-            str(output_path),
-        ]
-        # print(" ".join(command))
-        ret = subprocess.run(command, capture_output=True, text=True)
-        if ret.returncode != 0:
-            print("[-] Error joining audio")
-            print(f"[!] Command: {' '.join(command)}")
-        else:
-            print("[*] Joined audio fragments to single file.")
-        # Remove the audio list file
+        print(f"[*] Done: {output_path}")
         return output_path
-    
-    def _add_audio_to_video(self, output_path: Path) -> Path:
-        video_path = self.temp_dir / f"temp_video{self.input_path.suffix}"
-        audio_path = self.temp_dir / "temp_audio.mp3"
+
+    def _process_frames(
+        self,
+        input_path: Path,
+        temp_video: Path,
+        info: VideoInfo,
+        crop_w: int,
+        crop_h: int,
+        headroom: float,
+        hold_seconds: float,
+        scene_cut_threshold: float,
+        refocus_band: float | None,
+        show_preview: bool,
+        compare_preview: bool,
+    ) -> None:
+        stop_event = Event()
+        input_queue: Queue = Queue(maxsize=QUEUE_SIZE)
+        output_queue: Queue = Queue(maxsize=QUEUE_SIZE)
+        reader = VideoReader(input_path, input_queue, stop_event)
+        writer = VideoWriter(
+            temp_video,
+            output_queue,
+            (crop_w, crop_h),
+            info.fps,
+            stop_event,
+            show_preview=show_preview,
+        )
+
+        tracker = FaceTracker(info.width, info.height, hold_seconds=hold_seconds)
+        smoother = TargetSmoother(
+            info.width, info.height, crop_w, info.fps, refocus_band_fraction=refocus_band
+        )
+        cropper = SubpixelCropper(info.width, info.height, crop_w, crop_h)
+        scene_detector = SceneCutDetector(threshold=scene_cut_threshold)
+        # Face sits at `headroom` of crop height; camera center compensates.
+        headroom_shift = (0.5 - headroom) * crop_h
+        frame_center = (info.width / 2.0, info.height / 2.0)
+
+        reader.start()
+        writer.start()
+        started_at = time.perf_counter()
+        processed = 0
+        try:
+            while not stop_event.is_set():
+                item: VideoFrame | None = input_queue.get()
+                if item is None:
+                    break
+
+                now = item.frame_number / info.fps
+                faces = self.app.get(item.frame)
+                target = tracker.update(faces, now)
+
+                if scene_detector.update(item.frame):
+                    # Hard cut: drop all state from the dead shot and snap.
+                    tracker.reset()
+                    target = tracker.update(faces, now) or frame_center
+                    smoother.reset(target[0], target[1] + headroom_shift)
+                    cropper.reset()
+                elif target is None:
+                    target = frame_center
+
+                smooth_x, smooth_y = smoother.update(target[0], target[1] + headroom_shift)
+                # Sub-pixel crop: pans glide smoothly even on low-res sources
+                cropped = cropper.crop(item.frame, smooth_x, smooth_y)
+                preview = None
+                if show_preview:
+                    preview = compose_side_by_side(item.frame, cropped) if compare_preview else cropped
+                out_item = OutputItem(cropped, preview)
+                while not stop_event.is_set():
+                    try:
+                        output_queue.put(out_item, timeout=1.0)
+                        break
+                    except Full:
+                        continue
+                processed += 1
+                if processed % PROGRESS_EVERY_FRAMES == 0:
+                    self._print_progress(processed, info.frame_count, started_at)
+        except KeyboardInterrupt:
+            print("\n[!] Interrupted, finishing the frames written so far...")
+        finally:
+            stop_event.set()
+            # Writer may already be gone (preview quit); don't block on it
+            with contextlib.suppress(Full):
+                output_queue.put(None, timeout=1.0)
+            writer.join()
+            # Drain the input queue so a reader blocked on a full queue can exit
+            while reader.is_alive():
+                with contextlib.suppress(Empty):
+                    input_queue.get(timeout=0.1)
+            reader.join()
+            print(
+                f"\n[*] Processed {processed} frames "
+                f"({processed / max(1e-6, time.perf_counter() - started_at):.1f} fps)"
+            )
+        if writer.frames_written == 0:
+            raise RuntimeError("No frames were written; conversion failed")
+
+    @staticmethod
+    def _print_progress(processed: int, total: int, started_at: float) -> None:
+        rate = processed / max(1e-6, time.perf_counter() - started_at)
+        if total > 0:
+            message = f"[*] {processed}/{total} frames ({100 * processed / total:.1f}%) at {rate:.1f} fps"
+        else:
+            message = f"[*] {processed} frames at {rate:.1f} fps"
+        print(message, end="\r", file=sys.stderr)
+
+    @staticmethod
+    def _mux_audio(temp_video: Path, source: Path, output_path: Path, has_audio: bool) -> None:
+        if not has_audio:
+            shutil.move(str(temp_video), str(output_path))
+            return
         command = [
             "ffmpeg",
+            "-y",
             "-i",
-            str(video_path),
+            str(temp_video),
             "-i",
-            str(audio_path),
+            str(source),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
             "-c:v",
             "copy",
             "-c:a",
             "aac",
-            "-strict",
-            "experimental",
+            "-movflags",
+            "+faststart",
+            "-shortest",
             str(output_path),
         ]
-        ret = subprocess.run(command, capture_output=True, text=True)
-        if ret.returncode != 0:
-            print("[-] Error merging video and audio")
-            print(ret.stderr)
-        else:
-            print("[*] Merged video and audio")
-        return output_path
-
-
-if __name__ == "__main__":
-    # Example usage
-    converter = VerticalVideoConverter()
-    # Add your test code here 
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg audio mux failed: {result.stderr.strip()[-500:]}")
